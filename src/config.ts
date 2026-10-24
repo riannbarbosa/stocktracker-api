@@ -83,9 +83,22 @@ export const config = {
     cachePrefix: process.env.QUOTE_CACHE_PREFIX ?? 'quote:',
     maxSymbolsPerRequest: num(process.env.QUOTE_MAX_SYMBOLS, 10),
   },
+  /* Behind a reverse proxy every request arrives from the proxy's address, so
+   * the per-IP rate limits would be shared by everyone. Only enable it when a
+   * proxy you control sets X-Forwarded-For; otherwise a client forges it. */
+  trustProxy: bool(process.env.TRUST_PROXY, false),
   auth: {
     jwtSecret: required('JWT_SECRET'),
     tokenTtlSeconds: num(process.env.JWT_TTL_SECONDS, 3600),
+  },
+  passwordReset: {
+    tokenTtlSeconds: num(process.env.PASSWORD_RESET_TTL_SECONDS, 1800),
+    /* Front-end page that reads the token from the URL fragment. Without it the
+     * e-mail carries the bare token. */
+    url: process.env.PASSWORD_RESET_URL || null,
+    windowSeconds: num(process.env.PASSWORD_RESET_WINDOW_SECONDS, 3600),
+    maxPerIp: num(process.env.PASSWORD_RESET_MAX_PER_IP, 10),
+    maxPerEmail: num(process.env.PASSWORD_RESET_MAX_PER_EMAIL, 3),
   },
   notifications: {
     webhookTimeoutMs: num(process.env.WEBHOOK_TIMEOUT_MS, 5000),
