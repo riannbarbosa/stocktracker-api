@@ -10,7 +10,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { config } from '../config.ts';
 import { redisClient } from '../redis/redis.ts';
-import { findUserIdByEmail } from '../repositories/users.ts';
 import { sendMail, type SendMail } from './mailer.ts';
 
 interface Logger {
@@ -82,16 +81,13 @@ export function buildResetEmail(token: string): { subject: string; text: string 
   };
 }
 
-/* Runs after the route has already answered, so its duration — including
- * whether the address exists and whether SMTP is slow — never shows up in the
- * response time. Unknown addresses end here silently. */
+/* Runs after the route has already answered, so a slow SMTP server never
+ * shows up in the response time. The route has already found the user. */
 export async function requestPasswordReset(
+  userId: number,
   email: string,
   { logger, send = sendMail }: { logger: Logger; send?: SendMail },
 ): Promise<void> {
-  const userId = await findUserIdByEmail(email);
-  if (userId === null) return;
-
   const token = await issueResetToken(userId);
   await send({ to: email.toLowerCase(), ...buildResetEmail(token) });
   logger.info({ userId }, 'password reset e-mail sent');

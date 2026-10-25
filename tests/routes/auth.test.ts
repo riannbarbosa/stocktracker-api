@@ -144,6 +144,28 @@ describe('routes/auth', () => {
       }
       assert.equal(pg.queries.length, 0, 'nothing reached the database');
     });
+
+    /* 15+ characters of anything, or 8+ with a digit and a lowercase letter. */
+    it('applies the password policy', async () => {
+      const cases: [string, number][] = [
+        ['abcdef12', 201],
+        ['çãoéíõú1', 201],
+        ['ABCDEFGHIJKLMNO', 201],
+        ['abcdefgh', 400],
+        ['ABCDEF12', 400],
+        ['abcde12', 400],
+        ['ABCDEFGHIJKLMN', 400],
+      ];
+      for (const [password, status] of cases) {
+        pg.results([{ rows: [userRow(hash)] }]);
+        const response = await app.inject({
+          method: 'POST',
+          url: '/auth/register',
+          payload: { email: 'trader@example.test', password },
+        });
+        assert.equal(response.statusCode, status, password);
+      }
+    });
   });
 
   describe('POST /auth/login', () => {
@@ -293,17 +315,15 @@ describe('routes/auth', () => {
     }
 
     describe('POST /auth/forgot-password', () => {
-      /* The point of the route's shape: a registered and an unknown address are
-       * indistinguishable from the outside. */
-      it('answers 202 with the same body whether or not the address exists', async () => {
+      it('answers 202 for a registered address and 404 for an unknown one', async () => {
         pg.handle((_sql, params) => ({ rows: params[0] === 'trader@example.test' ? [{ id: '42' }] : [] }));
 
         const known = await forgot('trader@example.test');
         const unknown = await forgot('nobody@example.test');
 
         assert.equal(known.statusCode, 202);
-        assert.equal(unknown.statusCode, 202);
-        assert.deepEqual(known.json(), unknown.json());
+        assert.equal(unknown.statusCode, 404);
+        assert.deepEqual(unknown.json(), { error: 'email not registered' });
       });
 
       it('stores a token for a registered address only', async () => {
@@ -317,6 +337,7 @@ describe('routes/auth', () => {
       });
 
       it('limits requests per address, across IPs, with a Retry-After', async () => {
+        pg.results([{ rows: [{ id: '42' }] }]);
         for (let i = 0; i < config.passwordReset.maxPerEmail; i++) {
           assert.equal((await forgot('trader@example.test', `198.51.100.${i}`)).statusCode, 202);
         }
@@ -334,13 +355,14 @@ describe('routes/auth', () => {
         );
       });
 
+      /* Unknown addresses count too, so the 404 cannot be used to check a list. */
       it('limits requests per IP, across addresses', async () => {
         for (let i = 0; i < config.passwordReset.maxPerIp; i++) {
-          assert.equal((await forgot(`user${i}@example.test`)).statusCode, 202);
+          assert.equal((await forgot(`user${i}@example.test`)).statusCode, 404);
         }
 
         assert.equal((await forgot('another@example.test')).statusCode, 429);
-        assert.equal((await forgot('another@example.test', '192.0.2.1')).statusCode, 202);
+        assert.equal((await forgot('another@example.test', '192.0.2.1')).statusCode, 404);
       });
 
       it('fails closed with 503 when Redis is down', async () => {

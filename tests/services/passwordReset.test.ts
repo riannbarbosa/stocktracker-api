@@ -94,10 +94,9 @@ describe('services/passwordReset', () => {
 
   describe('requestPasswordReset', () => {
     it('e-mails a working token to a registered address', async () => {
-      pg.results([{ rows: [{ id: '42' }] }]);
       const sent: MailMessage[] = [];
 
-      await requestPasswordReset('Trader@Example.TEST', {
+      await requestPasswordReset(42, 'Trader@Example.TEST', {
         logger,
         send: async (message) => void sent.push(message),
       });
@@ -107,19 +106,6 @@ describe('services/passwordReset', () => {
       const token = /(\d+\.[A-Za-z0-9_-]{43})/.exec(sent[0]?.text ?? '')?.[1];
       assert.ok(token, 'no token in the e-mail');
       assert.equal(await consumeResetToken(token), 42);
-    });
-
-    it('does nothing at all for an unknown address', async () => {
-      pg.results([{ rows: [] }]);
-      const sent: MailMessage[] = [];
-
-      await requestPasswordReset('nobody@example.test', {
-        logger,
-        send: async (message) => void sent.push(message),
-      });
-
-      assert.equal(sent.length, 0);
-      assert.equal(redis.setCalls.length, 0);
     });
   });
 

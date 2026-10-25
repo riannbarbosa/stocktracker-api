@@ -3,7 +3,7 @@ import type { FastifyInstance, FastifyReply } from 'fastify';
 import { config } from '../config.ts';
 import { hitRateLimit } from '../lib/rateLimit.ts';
 import { redisClient } from '../redis/redis.ts';
-import { bumpTokenVersion, createUser, findUserByEmail, resetPassword } from '../repositories/users.ts';
+import { bumpTokenVersion, createUser, findUserByEmail, findUserIdByEmail, resetPassword } from '../repositories/users.ts';
 import { hashPassword, verifyPassword } from '../services/auth.ts';
 import { consumeResetToken, requestPasswordReset, sha256 } from '../services/passwordReset.ts';
 import { ownerOf } from '../plugins/authenticate.ts';
@@ -29,8 +29,13 @@ const registerBodySchema = {
   properties: {
     email: { type: 'string', format: 'email', description: 'Login identity.' },
     /* maxLength matters: scrypt hashes whatever it is handed, so an unbounded
-     * password is free CPU for whoever sends it. */
-    password: { type: 'string', minLength: 12, maxLength: 256 },
+     * password is free CPU for whoever sends it. 15+ characters of anything, or
+     * 8+ with a digit and a lowercase letter. */
+    password: {
+      type: 'string',
+      maxLength: 256,
+      anyOf: [{ minLength: 15 }, { minLength: 8, pattern: '^(?=.*\\d)(?=.*\\p{Ll})' }],
+    },
   },
 } as const;
 
@@ -75,8 +80,8 @@ const resetPasswordBodySchema = {
   },
 } as const;
 
-/* The same body whether or not the address is registered. */
-const FORGOT_ACCEPTED = { message: 'if the address is registered, a reset e-mail is on its way' };
+const FORGOT_ACCEPTED = { message: 'a reset e-mail is on its way' };
+const EMAIL_NOT_REGISTERED = { error: 'email not registered' };
 const RESET_UNAVAILABLE = { error: 'password reset is temporarily unavailable' };
 const INVALID_RESET_TOKEN = { error: 'invalid or expired token' };
 
@@ -149,12 +154,12 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       tags: ['auth'],
       summary: 'E-mail a password reset token',
       description:
-        'Always answers 202 with the same body, registered address or not, and ' +
-        'before the lookup runs, so neither the reply nor its timing reveals ' +
-        'which addresses exist. Asking again cancels the previous token.',
+        'Answers 202 and sends the e-mail when the address is registered, 404 ' +
+        'when it is not. Asking again cancels the previous token.',
       body: forgotPasswordBodySchema,
       response: {
         202: { type: 'object', properties: { message: { type: 'string' } } },
+        404: errorSchema,
         429: errorSchema,
         503: errorSchema,
       },
@@ -178,9 +183,13 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(503).send(RESET_UNAVAILABLE);
     }
 
+    /* After the rate limit, so the 404 cannot be used to check addresses in bulk. */
+    const userId = await findUserIdByEmail(email);
+    if (userId === null) return reply.code(404).send(EMAIL_NOT_REGISTERED);
+
     /* Not awaited: see requestPasswordReset. Failures, including SMTP not being
      * configured, are logged and never reach the caller. */
-    void requestPasswordReset(email, { logger: request.log }).catch((error: Error) => {
+    void requestPasswordReset(userId, email, { logger: request.log }).catch((error: Error) => {
       request.log.error({ err: error.message }, 'password reset e-mail failed');
     });
 

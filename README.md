@@ -241,7 +241,7 @@ curl -X POST http://localhost:3000/auth/forgot-password \
 ```
 
 ```json
-{ "message": "if the address is registered, a reset e-mail is on its way" }
+{ "message": "a reset e-mail is on its way" }
 ```
 
 Then trade the token for a new password. The reply is a fresh token, and every
@@ -258,7 +258,8 @@ token in the fragment (`…/reset#token=…`) instead of the bare token.
 
 | Route | Status | Meaning |
 | --- | --- | --- |
-| `POST /auth/forgot-password` | 202 | Always, registered address or not |
+| `POST /auth/forgot-password` | 202 | Address registered, e-mail on its way |
+| `POST /auth/forgot-password` | 404 | No account with this address |
 | `POST /auth/forgot-password` | 429 | Too many requests from this IP or for this address; see `Retry-After` |
 | `POST /auth/reset-password` | 200 | Password changed, older tokens revoked, new token issued |
 | `POST /auth/reset-password` | 400 | Password under 12 characters, **or** a token that is malformed, expired, already used or superseded — one message for all of those |
@@ -728,14 +729,15 @@ they fail the comparison and are all invalidated, which is the desired outcome.
 
 ### ✅ Password reset
 
-The flow is built so that it cannot be used to find out who has an account, to
-take one over, or to flood an inbox:
+The flow is built so that it cannot be used to take over an account or to
+flood an inbox:
 
-- **No enumeration.** `forgot-password` answers 202 with the same body for every
-  address, and answers *before* the lookup runs: finding the user, storing the
-  token and talking to SMTP happen after the reply, so response time does not
-  depend on whether the address exists. `reset-password` gives one 400 for every
-  kind of bad token.
+- **Says whether the address exists.** `forgot-password` answers 404 for an
+  unknown address, so the user knows to check the spelling or sign up instead
+  (registration already reveals the same through its 409). The rate limit runs
+  first, so this cannot be used to check addresses in bulk. Storing the token
+  and talking to SMTP happen after the reply. `reset-password` gives one 400
+  for every kind of bad token.
 - **Tokens are useless at rest.** A token is `<userId>.<32 random bytes>`. Redis
   holds only the SHA-256 of the secret, under `password-reset:<userId>`, with the
   TTL as the expiry, so a Redis dump cannot be replayed. A 256-bit secret needs
