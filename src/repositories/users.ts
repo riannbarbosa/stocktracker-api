@@ -75,3 +75,27 @@ export async function bumpTokenVersion(id: number): Promise<number | null> {
   const row = rows[0];
   return row ? Number(row.token_version) : null;
 }
+
+/* For the forgot-password flow, which only needs to know whether to send. */
+export async function findUserIdByEmail(email: string): Promise<number | null> {
+  const { rows } = await pool.query<{ id: string | number }>(
+    'SELECT id FROM users WHERE email = $1',
+    [email.toLowerCase()],
+  );
+  const row = rows[0];
+  return row ? Number(row.id) : null;
+}
+
+/* Sets the new hash and bumps token_version in one statement, so every token
+ * issued before the reset — including any held by whoever knew the old
+ * password — stops verifying at the same moment the password changes. */
+export async function resetPassword(id: number, passwordHash: string): Promise<User | null> {
+  const { rows } = await pool.query<UserRow>(
+    `UPDATE users SET password_hash = $2, token_version = token_version + 1
+     WHERE id = $1
+     RETURNING ${COLUMNS}`,
+    [id, passwordHash],
+  );
+  const row = rows[0];
+  return row ? toUser(row) : null;
+}

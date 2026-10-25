@@ -18,6 +18,7 @@ const REQUIRES_AUTH = 'Requires Auth';
 export async function buildApp(options: FastifyServerOptions = {}): Promise<FastifyInstance> {
   const app = Fastify({
     logger: { level: config.logLevel },
+    trustProxy: config.trustProxy,
      ajv: { customOptions: { strict: false } },
    ...options,    
   });
@@ -42,7 +43,7 @@ export async function buildApp(options: FastifyServerOptions = {}): Promise<Fast
         { name: 'notifications', description: 'In-app notifications created when an alert fires.' },
         { name: 'digest', description: 'Periodic watchlist summary sent by email.' },
         { name: 'health', description: 'Liveness and readiness probes.' },
-        { name: 'auth', description: 'Account creation and token issue.' },
+        { name: 'auth', description: 'Account creation, token issue and password reset.' },
       ],
       /* Gives Swagger UI its Authorize button; the protected routes reference
        * this scheme from their own schema. */
