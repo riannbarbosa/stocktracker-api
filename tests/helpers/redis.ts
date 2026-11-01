@@ -123,14 +123,32 @@ export function fakeRedis(): FakeRedis {
   };
 }
 
-/* Gives EVAL the behaviour of the two scripts the app runs — the rate limiter's
- * INCR/EXPIRE and the reset token's compare-and-delete — over `stored`, so a
- * test can exercise them end to end without a server. TTL is reported as the
- * full window. */
+/* Gives EVAL the behaviour of the scripts the app runs — the rate limiter's
+ * INCR/EXPIRE, the reset token's compare-and-delete and the login code's issue
+ * and redeem — over `stored`, so a test can exercise them end to end without a
+ * server. A login code hash is kept as JSON under its key. TTL is reported as
+ * the full window. */
 export function emulateScripts(redis: FakeRedis): void {
   const windows = new Map<string, number>();
   redis.handleEval((script, keys, args) => {
     const key = keys[0] ?? '';
+    if (script.includes("'HSET'")) {
+      redis.stored.set(key, JSON.stringify({ digest: args[0], attempts: 0, ttl: Number(args[1]) }));
+      return 1;
+    }
+    if (script.includes("'HINCRBY'")) {
+      const raw = redis.stored.get(key);
+      if (!raw) return 0;
+      const entry = JSON.parse(raw) as { digest: string; attempts: number };
+      if (entry.digest === args[0]) {
+        redis.stored.delete(key);
+        return 1;
+      }
+      entry.attempts += 1;
+      if (entry.attempts >= Number(args[1])) redis.stored.delete(key);
+      else redis.stored.set(key, JSON.stringify(entry));
+      return 0;
+    }
     if (script.includes("'INCR'")) {
       const count = Number(redis.stored.get(key) ?? 0) + 1;
       redis.stored.set(key, String(count));

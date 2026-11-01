@@ -100,6 +100,17 @@ export const config = {
     maxPerIp: num(process.env.PASSWORD_RESET_MAX_PER_IP, 10),
     maxPerEmail: num(process.env.PASSWORD_RESET_MAX_PER_EMAIL, 3),
   },
+  /* The e-mailed code that login and register hand out instead of a token. */
+  loginCode: {
+    ttlSeconds: num(process.env.LOGIN_CODE_TTL_SECONDS, 600),
+    /* Wrong codes a single challenge survives before it is discarded. */
+    maxAttempts: num(process.env.LOGIN_CODE_MAX_ATTEMPTS, 5),
+    windowSeconds: num(process.env.LOGIN_CODE_WINDOW_SECONDS, 3600),
+    /* Codes sent to one address per window, so one inbox cannot be flooded. */
+    maxPerEmail: num(process.env.LOGIN_CODE_MAX_PER_EMAIL, 10),
+    /* Verification attempts per IP per window. */
+    maxPerIp: num(process.env.LOGIN_CODE_MAX_PER_IP, 30),
+  },
   notifications: {
     webhookTimeoutMs: num(process.env.WEBHOOK_TIMEOUT_MS, 5000),
     /* A user-supplied webhook destination is checked against these before every
