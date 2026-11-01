@@ -1,15 +1,3 @@
-/* The e-mailed security code that stands between a correct password and a
- * token, for both login and registration. Lives in Redis for the same reasons
- * as the reset token: the expiry is the key's TTL and checking a code is one
- * atomic script.
- *
- * A request gets back a challenge, `<userId>.<secret>`, and the inbox gets a
- * six-digit code. Redemption needs both, so the code alone — six digits are
- * guessable — is worthless to anyone who did not also pass the password check.
- * Only the SHA-256 of `secret:code` is stored, under one key per user, so a
- * newer request supersedes the previous code, and a few wrong guesses burn the
- * challenge outright. */
-
 import { randomBytes, randomInt } from 'node:crypto';
 import { config } from '../config.ts';
 import { redisClient } from '../redis/redis.ts';
