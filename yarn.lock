@@ -99,6 +99,16 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@fastify/cors@npm:^11.3.1":
+  version: 11.3.1
+  resolution: "@fastify/cors@npm:11.3.1"
+  dependencies:
+    fastify-plugin: "npm:^6.0.0"
+    toad-cache: "npm:^3.7.0"
+  checksum: 10c0/0413b7e8251ec59c6f1901d618ee375a9d60dcf5b07f5cc1482dd1800a6aef7b1ce0cd7728fee60681d1d1ce09a4256ccce7cee0a1e5ef7093364fcbd6d5c00b
+  languageName: node
+  linkType: hard
+
 "@fastify/error@npm:^4.0.0, @fastify/error@npm:^4.2.0":
   version: 4.2.0
   resolution: "@fastify/error@npm:4.2.0"
@@ -1752,6 +1762,7 @@ __metadata:
   resolution: "stocktracker-api@workspace:."
   dependencies:
     "@eslint/js": "npm:^10.0.1"
+    "@fastify/cors": "npm:^11.3.1"
     "@fastify/jwt": "npm:^10.2.2"
     "@fastify/swagger": "npm:^9.8.1"
     "@fastify/swagger-ui": "npm:^6.1.1"

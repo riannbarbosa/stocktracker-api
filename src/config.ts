@@ -87,6 +87,9 @@ export const config = {
    * the per-IP rate limits would be shared by everyone. Only enable it when a
    * proxy you control sets X-Forwarded-For; otherwise a client forges it. */
   trustProxy: bool(process.env.TRUST_PROXY, false),
+  /* Browser origins allowed to call the API, e.g. the front-end on another
+   * domain. Exact matches only; empty sends no CORS headers at all. */
+  corsOrigins: list(process.env.CORS_ORIGINS, []).map((origin) => origin.replace(/\/+$/, '')),
   auth: {
     jwtSecret: required('JWT_SECRET'),
     tokenTtlSeconds: num(process.env.JWT_TTL_SECONDS, 3600),

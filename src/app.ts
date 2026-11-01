@@ -2,6 +2,7 @@ import Fastify from 'fastify';
 import fastifySwagger from '@fastify/swagger';
 import fastifySwaggerUi from '@fastify/swagger-ui';
 import fastifyJwt from '@fastify/jwt';
+import fastifyCors from '@fastify/cors';
 import type { FastifyInstance, FastifyServerOptions } from 'fastify';
 import { config } from './config.ts';
 import { authenticate } from './plugins/authenticate.ts';
@@ -22,6 +23,18 @@ export async function buildApp(options: FastifyServerOptions = {}): Promise<Fast
      ajv: { customOptions: { strict: false } },
    ...options,    
   });
+
+  /* Before the routes, so preflight OPTIONS requests are answered for all of
+   * them. Tokens travel in the Authorization header, not cookies, so
+   * credentials stay off. */
+  if (config.corsOrigins.length > 0) {
+    await app.register(fastifyCors, {
+      origin: config.corsOrigins,
+      methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'],
+      allowedHeaders: ['Content-Type', 'Authorization'],
+      maxAge: 600,
+    });
+  }
 
   /* Registered before the routes: @fastify/swagger collects each route's schema
    * as it is added, so anything registered earlier is missing from the spec. */
