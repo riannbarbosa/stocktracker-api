@@ -12,6 +12,7 @@ import {
   resetPassword,
 } from '../repositories/users.ts';
 import { hashPassword, verifyPassword } from '../services/auth.ts';
+import { verifyCaptcha } from '../services/captcha.ts';
 import { issueLoginCode, redeemLoginCode, sendLoginCode } from '../services/loginCode.ts';
 import { consumeResetToken, requestPasswordReset, sha256 } from '../services/passwordReset.ts';
 import { ownerOf } from '../plugins/authenticate.ts';
@@ -21,8 +22,13 @@ interface CredentialsBody {
   password: string;
 }
 
+interface RegisterBody extends CredentialsBody {
+  captchaToken?: string;
+}
+
 interface ForgotPasswordBody {
   email: string;
+  captchaToken?: string;
 }
 
 interface ResetPasswordBody {
@@ -34,6 +40,14 @@ interface VerifyCodeBody {
   challenge: string;
   code: string;
 }
+
+/* Optional in the schema: whether it is needed depends on TURNSTILE_SECRET_KEY,
+ * and a missing one gets the same 400 as a rejected one. */
+const captchaTokenSchema = {
+  type: 'string',
+  maxLength: 2048,
+  description: 'Cloudflare Turnstile token, required when the API has TURNSTILE_SECRET_KEY.',
+} as const;
 
 const registerBodySchema = {
   type: 'object',
@@ -49,6 +63,7 @@ const registerBodySchema = {
       maxLength: 256,
       anyOf: [{ minLength: 15 }, { minLength: 8, pattern: '^(?=.*\\d)(?=.*\\p{Ll})' }],
     },
+    captchaToken: captchaTokenSchema,
   },
 } as const;
 
@@ -89,7 +104,7 @@ const forgotPasswordBodySchema = {
   type: 'object',
   required: ['email'],
   additionalProperties: false,
-  properties: { email: { type: 'string', format: 'email' } },
+  properties: { email: { type: 'string', format: 'email' }, captchaToken: captchaTokenSchema },
 } as const;
 
 /* No pattern on token: a malformed one gets the same 400 as an expired one,
@@ -124,6 +139,8 @@ const PASSWORD_UPDATED = { message: 'password updated, sign in with the new one'
 const CODE_SENT = 'a security code is on its way';
 const LOGIN_UNAVAILABLE = { error: 'sign-in is temporarily unavailable' };
 const INVALID_CODE = { error: 'invalid or expired code' };
+const CAPTCHA_FAILED = { error: 'captcha verification failed' };
+const CAPTCHA_UNAVAILABLE = { error: 'captcha verification is temporarily unavailable' };
 
 /* Checks each [key, limit] in order and answers 429 at the first one exceeded.
  * Returns whether it did. A boolean, not the reply: FastifyReply is thenable,
@@ -144,6 +161,25 @@ async function rateLimited(
     }
   }
   return false;
+}
+
+/* Answers 400 when the Turnstile token is missing or rejected, and 503 when
+ * Cloudflare cannot be reached — failing open would let a bot through whenever
+ * it can make the check time out. Returns whether it answered. */
+async function captchaRejected(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  token: string | undefined,
+): Promise<boolean> {
+  try {
+    if (await verifyCaptcha(token, request.ip)) return false;
+  } catch (error) {
+    request.log.warn({ err: (error as Error).message }, 'captcha verification failed');
+    reply.code(503).send(CAPTCHA_UNAVAILABLE);
+    return true;
+  }
+  reply.code(400).send(CAPTCHA_FAILED);
+  return true;
 }
 
 /* Issues a code for `user`, answers with its challenge and e-mails the code
@@ -189,7 +225,7 @@ async function sendChallenge(
 const DUMMY_HASH = await hashPassword(randomBytes(32).toString('hex'));
 
 export async function authRoutes(app: FastifyInstance): Promise<void> {
-  app.post<{ Body: CredentialsBody }>('/auth/register', {
+  app.post<{ Body: RegisterBody }>('/auth/register', {
     schema: {
       tags: ['auth'],
       summary: 'Create an account and e-mail a security code',
@@ -198,12 +234,14 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         'POST /auth/verify-code. Without the code the account exists but ' +
         'POST /auth/login has to send a new one.',
       body: registerBodySchema,
-      response: { 201: challengeSchema, 409: errorSchema, 429: errorSchema, 503: errorSchema },
+      response: { 201: challengeSchema, 400: errorSchema, 409: errorSchema, 429: errorSchema, 503: errorSchema },
     },
   }, async (request, reply) => {
     /* Checked before the insert, so a Redis outage does not leave behind an
      * account whose first code was never sent. */
     if (!redisClient.isReady) return reply.code(503).send(LOGIN_UNAVAILABLE);
+    /* Before the insert and before scrypt, so a bot costs neither. */
+    if (await captchaRejected(request, reply, request.body.captchaToken)) return reply;
 
     const user = await createUser(request.body.email, await hashPassword(request.body.password));
     if (!user) return reply.code(409).send({ error: 'email already registered' });
@@ -281,6 +319,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       body: forgotPasswordBodySchema,
       response: {
         202: { type: 'object', properties: { message: { type: 'string' } } },
+        400: errorSchema,
         404: errorSchema,
         429: errorSchema,
         503: errorSchema,
@@ -304,6 +343,9 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       request.log.warn({ err: (error as Error).message }, 'password reset rate limit check failed');
       return reply.code(503).send(RESET_UNAVAILABLE);
     }
+
+    /* After the rate limit, which is cheaper than asking Cloudflare. */
+    if (await captchaRejected(request, reply, request.body.captchaToken)) return reply;
 
     /* After the rate limit, so the 404 cannot be used to check addresses in bulk. */
     const userId = await findUserIdByEmail(email);

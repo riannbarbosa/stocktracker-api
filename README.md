@@ -227,7 +227,7 @@ per-password salt; tokens are HS256, signed and verified by `@fastify/jwt`.
 | Route | Status | Meaning |
 | --- | --- | --- |
 | `POST /auth/register` | 201 | Account created, security code on its way |
-| `POST /auth/register` | 400 | Bad address, or password under 12 characters |
+| `POST /auth/register` | 400 | Bad address, password under 12 characters, or a missing or rejected `captchaToken` |
 | `POST /auth/register` | 409 | Address already registered |
 | `POST /auth/login` | 202 | Password correct, security code on its way |
 | `POST /auth/login` | 401 | Wrong password **or** unknown address — the reply is identical either way, so the endpoint cannot be used to discover which addresses exist |
@@ -286,6 +286,7 @@ token in the fragment (`…/reset#token=…`) instead of the bare token.
 | Route | Status | Meaning |
 | --- | --- | --- |
 | `POST /auth/forgot-password` | 202 | Address registered, e-mail on its way |
+| `POST /auth/forgot-password` | 400 | Missing or rejected `captchaToken` |
 | `POST /auth/forgot-password` | 404 | No account with this address |
 | `POST /auth/forgot-password` | 429 | Too many requests from this IP or for this address; see `Retry-After` |
 | `POST /auth/reset-password` | 200 | Password changed, older tokens revoked; sign in again |
@@ -653,6 +654,8 @@ you want to change. `.env.example` documents the full set.
 | `DIGEST_LOCK_KEY` | `digest_worker_lock` | Folded into a bigint for `pg_try_advisory_lock` |
 | `SMTP_URL` | *(none)* | e.g. `smtp://user:pass@host:587`; required to sign in (security code), and for the summary and password reset |
 | `EMAIL_FROM` | `stocktracker@localhost` | `From:` on outgoing mail |
+| `TURNSTILE_SECRET_KEY` | *(none)* | Cloudflare Turnstile secret; when set, `register` and `forgot-password` need a `captchaToken`. Unset turns the check off |
+| `TURNSTILE_TIMEOUT_MS` | `5000` | Timeout for Cloudflare's `siteverify` |
 | `LOGIN_CODE_TTL_SECONDS` | `600` | How long a sign-in security code works |
 | `LOGIN_CODE_MAX_ATTEMPTS` | `5` | Wrong codes before the challenge is discarded |
 | `LOGIN_CODE_WINDOW_SECONDS` | `3600` | Rate-limit window for the code routes |
@@ -778,6 +781,15 @@ challenge, `<userId>.<32 random bytes>`, and e-mail a six-digit code;
   limited per address (keyed on a digest). The e-mail goes out after the reply,
   so SMTP latency never shows in the response time — and an SMTP failure is
   only logged, the same as a reset e-mail.
+
+### ✅ Captcha on the routes that send e-mail
+
+With `TURNSTILE_SECRET_KEY` set, `register` and `forgot-password` take a
+`captchaToken` from the Cloudflare Turnstile widget and check it with
+`siteverify` before touching the database — so a bot cannot use them to spam
+inboxes or burn the SMTP quota. If Cloudflare cannot be reached they answer 503
+rather than fail open. `login` is left alone: the e-mailed code already stops a
+caller who only has the password.
 
 ### ✅ Password reset
 

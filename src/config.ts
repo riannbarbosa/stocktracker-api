@@ -100,6 +100,12 @@ export const config = {
     maxPerIp: num(process.env.PASSWORD_RESET_MAX_PER_IP, 10),
     maxPerEmail: num(process.env.PASSWORD_RESET_MAX_PER_EMAIL, 3),
   },
+  /* Cloudflare Turnstile on register and forgot-password. Unset turns the
+   * check off, for local development; Cloudflare publishes test keys too. */
+  captcha: {
+    secretKey: process.env.TURNSTILE_SECRET_KEY || null,
+    timeoutMs: num(process.env.TURNSTILE_TIMEOUT_MS, 5000),
+  },
   /* The e-mailed code that login and register hand out instead of a token. */
   loginCode: {
     ttlSeconds: num(process.env.LOGIN_CODE_TTL_SECONDS, 600),

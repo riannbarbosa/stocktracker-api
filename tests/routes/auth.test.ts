@@ -8,6 +8,7 @@ import { hashPassword } from '../../src/services/auth.ts';
 import { config } from '../../src/config.ts';
 import { issueLoginCode } from '../../src/services/loginCode.ts';
 import { issueResetToken } from '../../src/services/passwordReset.ts';
+import { jsonResponse, stubFetch, type FetchStub } from '../helpers/fetch.ts';
 import { fakePool, queryMatching, type FakePool } from '../helpers/pg.ts';
 import { emulateScripts, fakeRedis, type FakeRedis } from '../helpers/redis.ts';
 
@@ -588,6 +589,87 @@ describe('routes/auth', () => {
         assert.equal((await reset(`42.${'A'.repeat(43)}`)).statusCode, 503);
         assert.equal(pg.queries.length, 0);
       });
+    });
+  });
+
+  describe('captcha', () => {
+    let fetchStub: FetchStub;
+
+    beforeEach(() => {
+      config.captcha.secretKey = 'test-secret';
+      fetchStub = stubFetch();
+    });
+
+    afterEach(() => {
+      config.captcha.secretKey = null;
+      fetchStub.restore();
+    });
+
+    function register(captchaToken?: string) {
+      return app.inject({
+        method: 'POST',
+        url: '/auth/register',
+        payload: { email: 'trader@example.test', password: PASSWORD, captchaToken },
+      });
+    }
+
+    it('refuses to register without a token, before touching the database', async () => {
+      const response = await register();
+
+      assert.equal(response.statusCode, 400);
+      assert.deepEqual(response.json(), { error: 'captcha verification failed' });
+      assert.equal(fetchStub.calls.length, 0);
+      assert.equal(pg.queries.length, 0);
+    });
+
+    it('refuses a token Cloudflare rejects', async () => {
+      fetchStub.reply({ success: false, 'error-codes': ['invalid-input-response'] });
+
+      const response = await register('bad-token');
+
+      assert.equal(response.statusCode, 400);
+      assert.equal(pg.queries.length, 0);
+    });
+
+    it('registers once Cloudflare accepts the token', async () => {
+      fetchStub.reply({ success: true });
+      pg.results([{ rows: [userRow(hash)] }]);
+
+      const response = await register('good-token');
+
+      assert.equal(response.statusCode, 201);
+      assert.equal(fetchStub.calls[0]?.url, 'https://challenges.cloudflare.com/turnstile/v0/siteverify');
+    });
+
+    it('fails closed with 503 when Cloudflare cannot be reached', async () => {
+      fetchStub.handle(() => jsonResponse({ error: 'down' }, 500));
+
+      assert.equal((await register('good-token')).statusCode, 503);
+      assert.equal(pg.queries.length, 0);
+    });
+
+    it('guards forgot-password too, before looking the address up', async () => {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/auth/forgot-password',
+        payload: { email: 'trader@example.test' },
+      });
+
+      assert.equal(response.statusCode, 400);
+      assert.equal(pg.queries.length, 0);
+    });
+
+    it('leaves login alone: the e-mailed code already stops a bot', async () => {
+      pg.results([{ rows: [userRow(hash)] }]);
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/auth/login',
+        payload: { email: 'trader@example.test', password: PASSWORD },
+      });
+
+      assert.equal(response.statusCode, 202);
+      assert.equal(fetchStub.calls.length, 0);
     });
   });
 
