@@ -6,6 +6,7 @@ import { buildApp } from '../../src/app.ts';
 import type { JwtPayload } from '../../src/types/auth.ts';
 import { hashPassword } from '../../src/services/auth.ts';
 import { config } from '../../src/config.ts';
+import { issueLoginCode } from '../../src/services/loginCode.ts';
 import { issueResetToken } from '../../src/services/passwordReset.ts';
 import { fakePool, queryMatching, type FakePool } from '../helpers/pg.ts';
 import { emulateScripts, fakeRedis, type FakeRedis } from '../helpers/redis.ts';
@@ -22,25 +23,47 @@ function userRow(passwordHash: string) {
   };
 }
 
+interface ChallengeBody {
+  message: string;
+  challenge: string;
+  expiresIn: number;
+}
+
 describe('routes/auth', () => {
   let app: FastifyInstance;
   let pg: FakePool;
+  let redis: FakeRedis;
   let hash: string;
 
   beforeEach(async () => {
     pg = fakePool();
+    redis = fakeRedis();
+    emulateScripts(redis);
     app = await buildApp({ logger: false });
     await app.ready();
     hash = await hashPassword(PASSWORD);
   });
 
+  /* login, register and forgot-password finish their work after replying; let
+   * it settle before the fakes are taken away. */
   afterEach(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 10));
     await app.close();
+    redis.restore();
     pg.restore();
   });
 
+  function verify(challenge: string, code: string, ip = '203.0.113.7') {
+    return app.inject({
+      method: 'POST',
+      url: '/auth/verify-code',
+      payload: { challenge, code },
+      remoteAddress: ip,
+    });
+  }
+
   describe('POST /auth/register', () => {
-    it('creates the account and returns a usable token', async () => {
+    it('creates the account and answers with a challenge, not a token', async () => {
       pg.results([{ rows: [userRow(hash)] }]);
 
       const response = await app.inject({
@@ -50,22 +73,20 @@ describe('routes/auth', () => {
       });
 
       assert.equal(response.statusCode, 201);
-      const body = response.json() as { token: string; expiresIn: number };
-      assert.equal(body.expiresIn, 3600);
-
-      /* app.jwt.verify returns the raw claims; formatUser only runs on
-       * request.jwtVerify(), which is covered by the round trip below. */
-      const claims = app.jwt.verify<JwtPayload>(body.token);
-      assert.equal(claims.sub, '42');
-      assert.equal(claims.email, 'trader@example.test');
+      const body = response.json() as ChallengeBody & { token?: string };
+      assert.equal(body.token, undefined, 'register must not sign the user in by itself');
+      assert.match(body.challenge, /^42\.[A-Za-z0-9_-]{43}$/);
+      assert.equal(body.expiresIn, config.loginCode.ttlSeconds);
+      assert.ok(redis.stored.has('login-code:42'), 'no code was issued');
     });
 
-    /* The point of the whole flow: a token from register is accepted by a
+    /* The point of the whole flow: the token from verify-code is accepted by a
      * protected route, and formatUser turns `sub` into the owner id the
      * repository is scoped by. */
-    it('issues a token a protected route accepts, scoped to the new user', async () => {
+    it('issues, once the code checks out, a token a protected route accepts', async () => {
       pg.handle((sql) => {
         if (sql.includes('INSERT INTO users')) return { rows: [userRow(hash)] };
+        if (sql.includes('FROM users WHERE id')) return { rows: [userRow(hash)] };
         if (sql.includes('token_version')) return { rows: [{ token_version: 0 }] };
         return { rows: [] };
       });
@@ -75,7 +96,14 @@ describe('routes/auth', () => {
         url: '/auth/register',
         payload: { email: 'trader@example.test', password: PASSWORD },
       });
-      const { token } = registered.json() as { token: string };
+      assert.equal(registered.statusCode, 201);
+
+      /* The code only travels by e-mail, so the test issues its own — which
+       * also supersedes the one register sent. */
+      const { challenge, code } = await issueLoginCode(42);
+      const verified = await verify(challenge, code);
+      assert.equal(verified.statusCode, 200);
+      const { token } = verified.json() as { token: string };
 
       const response = await app.inject({
         method: 'GET',
@@ -132,6 +160,20 @@ describe('routes/auth', () => {
 
       assert.equal(response.statusCode, 409);
       assert.deepEqual(response.json(), { error: 'email already registered' });
+      assert.equal(redis.stored.size, 0, 'a code was issued for an existing account');
+    });
+
+    it('fails closed with 503, before creating anything, when Redis is down', async () => {
+      redis.setReady(false);
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/auth/register',
+        payload: { email: 'trader@example.test', password: PASSWORD },
+      });
+
+      assert.equal(response.statusCode, 503);
+      assert.equal(pg.queries.length, 0);
     });
 
     it('rejects a short password and a malformed address', async () => {
@@ -169,31 +211,54 @@ describe('routes/auth', () => {
   });
 
   describe('POST /auth/login', () => {
-    it('returns a token for the right password', async () => {
+    function login(password = PASSWORD, email = 'trader@example.test') {
+      return app.inject({ method: 'POST', url: '/auth/login', payload: { email, password } });
+    }
+
+    it('answers the right password with a challenge, not a token', async () => {
       pg.results([{ rows: [userRow(hash)] }]);
 
-      const response = await app.inject({
-        method: 'POST',
-        url: '/auth/login',
-        payload: { email: 'trader@example.test', password: PASSWORD },
-      });
+      const response = await login();
 
-      assert.equal(response.statusCode, 200);
-      const claims = app.jwt.verify<JwtPayload>((response.json() as { token: string }).token);
-      assert.equal(claims.sub, '42');
+      assert.equal(response.statusCode, 202);
+      const body = response.json() as ChallengeBody & { token?: string };
+      assert.equal(body.token, undefined, 'a password alone must not be enough to sign in');
+      assert.match(body.challenge, /^42\.[A-Za-z0-9_-]{43}$/);
+      assert.equal(body.expiresIn, config.loginCode.ttlSeconds);
+      assert.ok(redis.stored.has('login-code:42'));
     });
 
-    it('answers 401 for the wrong password', async () => {
+    it('answers 401 for the wrong password, without sending a code', async () => {
       pg.results([{ rows: [userRow(hash)] }]);
 
-      const response = await app.inject({
-        method: 'POST',
-        url: '/auth/login',
-        payload: { email: 'trader@example.test', password: 'not-the-password' },
-      });
+      const response = await login('not-the-password');
 
       assert.equal(response.statusCode, 401);
       assert.deepEqual(response.json(), { error: 'invalid credentials' });
+      assert.equal(redis.evalCalls.length, 0);
+    });
+
+    it('limits the codes sent to one address, with a Retry-After', async () => {
+      pg.results([{ rows: [userRow(hash)] }]);
+      for (let i = 0; i < config.loginCode.maxPerEmail; i++) {
+        assert.equal((await login()).statusCode, 202);
+      }
+
+      const response = await login();
+
+      assert.equal(response.statusCode, 429);
+      assert.equal(response.headers['retry-after'], String(config.loginCode.windowSeconds));
+      assert.ok(
+        redis.evalCalls.every((call) => !call.keys.some((key) => key.includes('trader@'))),
+        'the address reached Redis in clear',
+      );
+    });
+
+    it('fails closed with 503 when Redis is down', async () => {
+      redis.setReady(false);
+      pg.results([{ rows: [userRow(hash)] }]);
+
+      assert.equal((await login()).statusCode, 503);
     });
 
     /* Same status and same body for an unknown address as for a wrong password,
@@ -209,6 +274,89 @@ describe('routes/auth', () => {
 
       assert.equal(response.statusCode, 401);
       assert.deepEqual(response.json(), { error: 'invalid credentials' });
+    });
+  });
+
+  describe('POST /auth/verify-code', () => {
+    it('exchanges the challenge and its code for a token with the current version', async () => {
+      const { challenge, code } = await issueLoginCode(42);
+      pg.results([{ rows: [{ ...userRow(hash), token_version: 3 }] }]);
+
+      const response = await verify(challenge, code);
+
+      assert.equal(response.statusCode, 200);
+      const body = response.json() as { token: string; expiresIn: number };
+      assert.equal(body.expiresIn, config.auth.tokenTtlSeconds);
+      const claims = app.jwt.verify<JwtPayload>(body.token);
+      assert.equal(claims.sub, '42');
+      assert.equal(claims.ver, 3);
+    });
+
+    it('accepts a code only once', async () => {
+      const { challenge, code } = await issueLoginCode(42);
+      pg.results([{ rows: [userRow(hash)] }]);
+
+      assert.equal((await verify(challenge, code)).statusCode, 200);
+      const again = await verify(challenge, code);
+
+      assert.equal(again.statusCode, 400);
+      assert.deepEqual(again.json(), { error: 'invalid or expired code' });
+    });
+
+    it('discards the challenge after too many wrong codes', async () => {
+      const { challenge, code } = await issueLoginCode(42);
+      const wrong = code === '000000' ? '000001' : '000000';
+      pg.results([{ rows: [userRow(hash)] }]);
+
+      for (let i = 0; i < config.loginCode.maxAttempts; i++) {
+        assert.equal((await verify(challenge, wrong)).statusCode, 400);
+      }
+
+      assert.equal((await verify(challenge, code)).statusCode, 400, 'the right code still worked');
+    });
+
+    it('refuses a code once a newer one was sent', async () => {
+      const first = await issueLoginCode(42);
+      const second = await issueLoginCode(42);
+      pg.results([{ rows: [userRow(hash)] }]);
+
+      assert.equal((await verify(first.challenge, first.code)).statusCode, 400);
+      assert.equal((await verify(second.challenge, second.code)).statusCode, 200);
+    });
+
+    it('answers the same 400 for a malformed challenge or code', async () => {
+      const { challenge } = await issueLoginCode(42);
+      for (const [c, code] of [['garbage', '123456'], [challenge, 'abc'], [challenge, '1234567']]) {
+        const response = await verify(c ?? '', code ?? '');
+        assert.equal(response.statusCode, 400, `${c} ${code}`);
+        assert.deepEqual(response.json(), { error: 'invalid or expired code' });
+      }
+      assert.equal(pg.queries.length, 0);
+    });
+
+    it('answers 400 when the account was deleted after the code went out', async () => {
+      const { challenge, code } = await issueLoginCode(42);
+      pg.results([{ rows: [] }]);
+
+      assert.equal((await verify(challenge, code)).statusCode, 400);
+    });
+
+    it('limits attempts per IP', async () => {
+      for (let i = 0; i < config.loginCode.maxPerIp; i++) {
+        assert.equal((await verify('garbage', '000000')).statusCode, 400);
+      }
+
+      const { challenge, code } = await issueLoginCode(42);
+      pg.results([{ rows: [userRow(hash)] }]);
+
+      assert.equal((await verify(challenge, code)).statusCode, 429);
+      assert.equal((await verify(challenge, code, '192.0.2.1')).statusCode, 200);
+    });
+
+    it('fails closed with 503 when Redis is down', async () => {
+      redis.setReady(false);
+
+      assert.equal((await verify(`42.${'A'.repeat(43)}`, '123456')).statusCode, 503);
     });
   });
 
@@ -287,20 +435,6 @@ describe('routes/auth', () => {
   });
 
   describe('password reset', () => {
-    let redis: FakeRedis;
-
-    beforeEach(() => {
-      redis = fakeRedis();
-      emulateScripts(redis);
-    });
-
-    /* forgot-password finishes its work after replying; let it settle before
-     * the fakes are taken away. */
-    afterEach(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      redis.restore();
-    });
-
     function forgot(email: string, ip = '203.0.113.7') {
       return app.inject({ method: 'POST', url: '/auth/forgot-password', payload: { email }, remoteAddress: ip });
     }
@@ -381,7 +515,7 @@ describe('routes/auth', () => {
     });
 
     describe('POST /auth/reset-password', () => {
-      it('sets the new password, revokes old tokens and returns a fresh one', async () => {
+      it('sets the new password and revokes old tokens without signing anyone in', async () => {
         const token = await issueResetToken(42);
         pg.results([{ rows: [{ ...userRow('ignored'), token_version: 3 }] }]);
 
@@ -395,9 +529,8 @@ describe('routes/auth', () => {
         assert.notEqual(update.params[1], 'a-brand-new-password', 'the plaintext reached the database');
         assert.match(String(update.params[1]), /^scrypt\$/);
 
-        const claims = app.jwt.verify<JwtPayload>((response.json() as { token: string }).token);
-        assert.equal(claims.sub, '42');
-        assert.equal(claims.ver, 3, 'the new token must carry the bumped version');
+        /* The new password has to go through login and its e-mailed code. */
+        assert.deepEqual(response.json(), { message: 'password updated, sign in with the new one' });
       });
 
       it('accepts a token only once', async () => {
@@ -465,6 +598,7 @@ describe('routes/auth', () => {
         (paths[path] as Record<string, { security?: unknown[] }> | undefined)?.[method]?.security;
 
       assert.equal(security('/auth/login', 'post'), undefined, 'login must not require a token');
+      assert.equal(security('/auth/verify-code', 'post'), undefined);
       assert.equal(security('/auth/forgot-password', 'post'), undefined);
       assert.equal(security('/auth/reset-password', 'post'), undefined);
       assert.deepEqual(security('/alerts', 'get'), [{ bearerAuth: [] }]);

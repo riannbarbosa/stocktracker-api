@@ -65,12 +65,19 @@ avoids brapi's free-tier rate limit.
 
 ### First requests
 
-Most routes need a token. Register once and keep the token in a shell variable:
+Most routes need a token. Signing in takes two steps — the password, then a
+six-digit security code sent by e-mail — so `SMTP_URL` has to be set. Register
+once, then trade the challenge and the code from your inbox for a token:
 
 ```bash
-TOKEN=$(curl -s -X POST http://localhost:3000/auth/register \
+CHALLENGE=$(curl -s -X POST http://localhost:3000/auth/register \
   -H 'content-type: application/json' \
   -d '{"email":"you@example.com","password":"a-long-enough-password"}' \
+  | sed 's/.*"challenge":"\([^"]*\)".*/\1/')
+
+TOKEN=$(curl -s -X POST http://localhost:3000/auth/verify-code \
+  -H 'content-type: application/json' \
+  -d "{\"challenge\":\"$CHALLENGE\",\"code\":\"<code from the e-mail>\"}" \
   | sed 's/.*"token":"\([^"]*\)".*/\1/')
 
 curl http://localhost:3000/quotes/PETR4                          # public
@@ -78,7 +85,7 @@ curl http://localhost:3000/watchlist -H "authorization: Bearer $TOKEN"
 ```
 
 Tokens expire after an hour (`JWT_TTL_SECONDS`); call `/auth/login` with the
-same body to get a new one. In Swagger UI, paste the token into **Authorize**.
+same body for a new code, then `/auth/verify-code` again. In Swagger UI, paste the token into **Authorize**.
 The examples below assume `$TOKEN` is set.
 
 If Docker isn't installed, `make docker-install` handles it on Debian/Ubuntu
@@ -123,8 +130,9 @@ yarn dev        # watch mode
 | | Method | Route | What |
 | --- | --- | --- | --- |
 | 🔓 | `GET` | `/quotes/:symbols` | Quotes for up to 10 tickers, Redis-cached |
-| 🔓 | `POST` | `/auth/register` | Create an account, get a token |
-| 🔓 | `POST` | `/auth/login` | Exchange credentials for a token |
+| 🔓 | `POST` | `/auth/register` | Create an account, e-mail a security code |
+| 🔓 | `POST` | `/auth/login` | Check credentials, e-mail a security code |
+| 🔓 | `POST` | `/auth/verify-code` | Exchange the challenge and its code for a token |
 | 🔓 | `POST` | `/auth/forgot-password` | E-mail a password reset token |
 | 🔓 | `POST` | `/auth/reset-password` | Choose a new password with that token |
 | 🔒 | `POST` | `/auth/logout-all` | Revoke every token issued to the account |
@@ -183,7 +191,7 @@ the value.
 | 404 | brapi does not know one of the symbols |
 | 502 | brapi unavailable after retries |
 
-### `POST /auth/register`, `POST /auth/login`
+### `POST /auth/register`, `POST /auth/login`, `POST /auth/verify-code`
 
 `/quotes`, `/docs` and the health probes are public. Everything marked 🔒 in
 the table above needs `Authorization: Bearer <token>`, and every row it touches
@@ -196,20 +204,38 @@ curl -X POST http://localhost:3000/auth/register \
 ```
 
 ```json
+{ "message": "a security code is on its way", "challenge": "42.<secret>", "expiresIn": 600 }
+```
+
+`login` takes the same body and returns the same shape once the password
+checks out. Neither hands out a token: that takes the challenge plus the
+six-digit code from the e-mail:
+
+```bash
+curl -X POST http://localhost:3000/auth/verify-code \
+  -H 'content-type: application/json' \
+  -d '{"challenge":"42.<secret>","code":"123456"}'
+```
+
+```json
 { "token": "eyJhbGciOiJIUzI1NiIs...", "expiresIn": 3600 }
 ```
 
-`login` takes the same body and returns the same shape. Passwords are hashed
-with `scrypt` (`node:crypto`, no native dependency) and a per-password salt;
-tokens are HS256, signed and verified by `@fastify/jwt`.
+Passwords are hashed with `scrypt` (`node:crypto`, no native dependency) and a
+per-password salt; tokens are HS256, signed and verified by `@fastify/jwt`.
 
 | Route | Status | Meaning |
 | --- | --- | --- |
-| `POST /auth/register` | 201 | Account created, token issued |
+| `POST /auth/register` | 201 | Account created, security code on its way |
 | `POST /auth/register` | 400 | Bad address, or password under 12 characters |
 | `POST /auth/register` | 409 | Address already registered |
-| `POST /auth/login` | 200 | Token issued |
+| `POST /auth/login` | 202 | Password correct, security code on its way |
 | `POST /auth/login` | 401 | Wrong password **or** unknown address — the reply is identical either way, so the endpoint cannot be used to discover which addresses exist |
+| `POST /auth/register`, `/auth/login` | 429 | Too many codes sent to this address; see `Retry-After` |
+| `POST /auth/verify-code` | 200 | Token issued |
+| `POST /auth/verify-code` | 400 | Wrong, expired, used or superseded code — one message for all of those |
+| `POST /auth/verify-code` | 429 | Too many attempts from this IP |
+| all three | 503 | Redis is down; codes and rate limits live there |
 
 Every protected route answers **401** without a token, and Swagger UI has an
 **Authorize** button that puts one on each request.
@@ -244,8 +270,9 @@ curl -X POST http://localhost:3000/auth/forgot-password \
 { "message": "a reset e-mail is on its way" }
 ```
 
-Then trade the token for a new password. The reply is a fresh token, and every
-token issued before the reset stops working:
+Then trade the token for a new password. Every token issued before the reset
+stops working, and nobody is signed in by it — the new password goes through
+`/auth/login` and its security code like any other:
 
 ```bash
 curl -X POST http://localhost:3000/auth/reset-password \
@@ -261,7 +288,7 @@ token in the fragment (`…/reset#token=…`) instead of the bare token.
 | `POST /auth/forgot-password` | 202 | Address registered, e-mail on its way |
 | `POST /auth/forgot-password` | 404 | No account with this address |
 | `POST /auth/forgot-password` | 429 | Too many requests from this IP or for this address; see `Retry-After` |
-| `POST /auth/reset-password` | 200 | Password changed, older tokens revoked, new token issued |
+| `POST /auth/reset-password` | 200 | Password changed, older tokens revoked; sign in again |
 | `POST /auth/reset-password` | 400 | Password under 12 characters, **or** a token that is malformed, expired, already used or superseded — one message for all of those |
 | `POST /auth/reset-password` | 429 | Too many attempts from this IP |
 | both | 503 | Redis is down; reset tokens and rate limits live there |
@@ -624,8 +651,13 @@ you want to change. `.env.example` documents the full set.
 | `DIGEST_TIME_ZONE` | `America/Sao_Paulo` | IANA zone for the hour and the calendar |
 | `DIGEST_CHECK_INTERVAL_MS` | `900000` | How often the worker looks for due summaries |
 | `DIGEST_LOCK_KEY` | `digest_worker_lock` | Folded into a bigint for `pg_try_advisory_lock` |
-| `SMTP_URL` | *(none)* | e.g. `smtp://user:pass@host:587`; required for the summary and password reset |
+| `SMTP_URL` | *(none)* | e.g. `smtp://user:pass@host:587`; required to sign in (security code), and for the summary and password reset |
 | `EMAIL_FROM` | `stocktracker@localhost` | `From:` on outgoing mail |
+| `LOGIN_CODE_TTL_SECONDS` | `600` | How long a sign-in security code works |
+| `LOGIN_CODE_MAX_ATTEMPTS` | `5` | Wrong codes before the challenge is discarded |
+| `LOGIN_CODE_WINDOW_SECONDS` | `3600` | Rate-limit window for the code routes |
+| `LOGIN_CODE_MAX_PER_EMAIL` | `10` | Codes sent per address per window |
+| `LOGIN_CODE_MAX_PER_IP` | `30` | `verify-code` attempts per IP per window |
 | `PASSWORD_RESET_TTL_SECONDS` | `1800` | How long a reset token works |
 | `PASSWORD_RESET_URL` | *(none)* | Reset page linked from the e-mail, token in the fragment; without it the e-mail carries the bare token |
 | `PASSWORD_RESET_WINDOW_SECONDS` | `3600` | Rate-limit window for both reset routes |
@@ -727,6 +759,26 @@ validation — an authenticated but malformed request still costs the version
 lookup. And tokens issued before this mechanism existed carry no `ver` claim, so
 they fail the comparison and are all invalidated, which is the desired outcome.
 
+### ✅ Sign-in security code
+
+A password alone never yields a token. `login` and `register` answer with a
+challenge, `<userId>.<32 random bytes>`, and e-mail a six-digit code;
+`verify-code` needs both:
+
+- **The code is bound to the challenge.** Redis holds only the SHA-256 of
+  `secret:code` under `login-code:<userId>`, so six digits are worthless without
+  the challenge that only the password holder received, and a dump cannot be
+  replayed.
+- **Few guesses.** Redeeming is one Lua script: a match deletes the key, a miss
+  is counted and `LOGIN_CODE_MAX_ATTEMPTS` misses delete it too. `verify-code` is
+  also limited per IP.
+- **Latest only, short-lived.** One key per user, so a new login overwrites the
+  previous code; the TTL (`LOGIN_CODE_TTL_SECONDS`) is the expiry.
+- **Bounded e-mail.** Codes are sent only after the password checks out and are
+  limited per address (keyed on a digest). The e-mail goes out after the reply,
+  so SMTP latency never shows in the response time — and an SMTP failure is
+  only logged, the same as a reset e-mail.
+
 ### ✅ Password reset
 
 The flow is built so that it cannot be used to take over an account or to
@@ -761,8 +813,9 @@ flood an inbox:
 use up an address's reset e-mails for a window (`PASSWORD_RESET_MAX_PER_EMAIL`
 trades spam protection against that). Behind a reverse proxy every request
 shares the proxy's IP until `TRUST_PROXY=true`, and setting it without a proxy
-lets clients pick their own IP. `/auth/login` itself is not rate limited yet;
-`hitRateLimit()` is the piece to reuse for it.
+lets clients pick their own IP. Password guesses on `/auth/login` are not rate
+limited yet — only the codes it sends are; `hitRateLimit()` is the piece to
+reuse for it.
 
 ### ⚠️ Robustness: database errors reach the client verbatim
 
